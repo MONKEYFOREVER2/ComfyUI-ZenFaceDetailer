@@ -1,13 +1,102 @@
 import torch
 import numpy as np
 import cv2
-import os
 import comfy.model_management as model_management
 import comfy.samplers
 import comfy.sd
 import comfy.utils
 import folder_paths
 from nodes import common_ksampler
+
+
+def _create_elliptical_mask(h, w):
+    """Create an elliptical binary mask (1 inside, 0 outside)."""
+    mask = np.zeros((h, w), dtype=np.float32)
+    cx, cy = w // 2, h // 2
+    cv2.ellipse(mask, (cx, cy), (cx, cy), 0, 0, 360, 1.0, -1)
+    return mask
+
+
+def _create_squircle_mask(h, w, n=4):
+    """Create a superellipse (squircle) mask with exponent n."""
+    y = np.linspace(-1, 1, h).reshape(-1, 1)
+    x = np.linspace(-1, 1, w).reshape(1, -1)
+    d = np.abs(x) ** n + np.abs(y) ** n
+    mask = np.where(d <= 1.0, 1.0, 0.0).astype(np.float32)
+    return mask
+
+
+def _create_rectangle_mask(h, w):
+    """Create a full rectangle mask."""
+    return np.ones((h, w), dtype=np.float32)
+
+
+def _feather_mask(mask, feather_px):
+    """Apply gaussian feathering to the edges of a binary mask."""
+    if feather_px <= 0:
+        return mask
+    # Use distance transform for smooth falloff from edges
+    # Invert mask to get distance from edge (outside->inside)
+    mask_u8 = (mask * 255).astype(np.uint8)
+    dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    # Normalize so that pixels at feather_px distance are fully opaque
+    feathered = np.clip(dist / max(feather_px, 1), 0.0, 1.0).astype(np.float32)
+    return feathered
+
+
+def _expand_mask(mask, pixels):
+    """Dilate (positive) or erode (negative) a binary mask."""
+    if pixels == 0:
+        return mask
+    kernel_size = abs(pixels) * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    mask_u8 = (mask * 255).astype(np.uint8)
+    if pixels > 0:
+        result = cv2.dilate(mask_u8, kernel, iterations=1)
+    else:
+        result = cv2.erode(mask_u8, kernel, iterations=1)
+    return result.astype(np.float32) / 255.0
+
+
+def _match_color(source, target):
+    """Match the color statistics of source to target (per-channel mean/std transfer)."""
+    result = source.copy().astype(np.float32)
+    for c in range(3):
+        s_mean, s_std = result[:, :, c].mean(), result[:, :, c].std() + 1e-6
+        t_mean, t_std = target[:, :, c].mean(), target[:, :, c].std() + 1e-6
+        result[:, :, c] = (result[:, :, c] - s_mean) * (t_std / s_std) + t_mean
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _blend_soft_light(base, detail, alpha):
+    """Soft light blend mode with alpha mask."""
+    base_f = base.astype(np.float32) / 255.0
+    detail_f = detail.astype(np.float32) / 255.0
+    # Pegtop soft light formula
+    blended = (1 - 2 * detail_f) * base_f * base_f + 2 * detail_f * base_f
+    blended = np.clip(blended, 0, 1)
+    # Mix using alpha
+    result = base_f * (1 - alpha) + blended * alpha
+    return (np.clip(result, 0, 1) * 255).astype(np.uint8)
+
+
+def _blend_overlay(base, detail, alpha):
+    """Overlay blend mode with alpha mask."""
+    base_f = base.astype(np.float32) / 255.0
+    detail_f = detail.astype(np.float32) / 255.0
+    # Overlay formula
+    low = 2 * base_f * detail_f
+    high = 1 - 2 * (1 - base_f) * (1 - detail_f)
+    blended = np.where(base_f < 0.5, low, high)
+    blended = np.clip(blended, 0, 1)
+    result = base_f * (1 - alpha) + blended * alpha
+    return (np.clip(result, 0, 1) * 255).astype(np.uint8)
+
+
+def _blend_normal(base, detail, alpha):
+    """Normal alpha blend."""
+    return (detail * alpha + base * (1 - alpha)).astype(np.uint8)
+
 
 class ZenFaceDetailer:
     @classmethod
@@ -30,7 +119,15 @@ class ZenFaceDetailer:
                 "bbox_dilation": ("INT", {"default": 10, "min": -512, "max": 512, "step": 1}),
                 "bbox_crop_factor": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 10.0, "step": 0.1}),
                 "drop_size": ("INT", {"default": 10, "min": 1, "max": 10000, "step": 1}),
-                "blur_mask": ("INT", {"default": 16, "min": 0, "max": 100, "step": 1}),
+                
+                # Mask & Feathering
+                "mask_shape": (["ellipse", "squircle", "rectangle"],),
+                "feather_amount": ("INT", {"default": 40, "min": 0, "max": 200, "step": 1}),
+                "mask_expand": ("INT", {"default": 0, "min": -100, "max": 100, "step": 1}),
+                
+                # Blending
+                "blend_mode": (["normal", "soft_light", "overlay"],),
+                "color_match": ("BOOLEAN", {"default": True}),
                 
                 # ClownsharKSampler-like Noise / Advanced Sampler Settings
                 "noise_type_init": (["default", "gaussian", "uniform", "perlin", "simplex"],),
@@ -51,7 +148,9 @@ class ZenFaceDetailer:
     CATEGORY = "Zen/Detailers"
 
     def process(self, image, model, clip, vae, positive, negative, bbox_detector,
-                bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size, blur_mask,
+                bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size,
+                mask_shape, feather_amount, mask_expand,
+                blend_mode, color_match,
                 noise_type_init, eta, sampler_mode, sampler_name, scheduler, steps, cfg, denoise, seed):
                 
         print("🎭 ZenFaceDetailer: Starting processing...")
@@ -61,7 +160,6 @@ class ZenFaceDetailer:
         
         for b in range(batch_size):
             img_tensor = image[b] # (H, W, C)
-            img_tensor_batch = img_tensor.unsqueeze(0).movedim(-1, 1) # Comfy standard B, C, H, W for detectors usually, but impact wants B, H, W, C
             # Impact pack detect takes B, H, W, C
             img_input = img_tensor.unsqueeze(0)
             
@@ -98,7 +196,6 @@ class ZenFaceDetailer:
                     
                 x1, y1, x2, y2 = map(int, crop_region)
                 
-                # Expand slightly over the crop region because Impact Pack crop_region is exact bbox with crop_factor applied
                 # Make sure crop dimensions are multiples of 8 for VAE
                 crop_w = x2 - x1
                 crop_h = y2 - y1
@@ -144,18 +241,35 @@ class ZenFaceDetailer:
                 decoded_np = (decoded[0].cpu().numpy() * 255.0).astype(np.uint8)
                 decoded_np = cv2.resize(decoded_np, (crop_w, crop_h))
                 
-                # Local Feathered Mask
-                local_mask = np.ones((crop_h, crop_w), dtype=np.float32)
-                if blur_mask > 0:
-                    local_mask_8u = (local_mask * 255).astype(np.uint8)
-                    cv2.rectangle(local_mask_8u, (0,0), (crop_w-1, crop_h-1), 0, blur_mask * 2)
-                    local_mask = cv2.GaussianBlur(local_mask_8u, (blur_mask*4|1, blur_mask*4|1), 0).astype(np.float32) / 255.0
+                # --- Color matching ---
+                if color_match:
+                    decoded_np = _match_color(decoded_np, crop_np)
                 
+                # --- Shaped mask generation ---
+                if mask_shape == "ellipse":
+                    local_mask = _create_elliptical_mask(crop_h, crop_w)
+                elif mask_shape == "squircle":
+                    local_mask = _create_squircle_mask(crop_h, crop_w, n=4)
+                else:
+                    local_mask = _create_rectangle_mask(crop_h, crop_w)
+                
+                # --- Expand / shrink ---
+                if mask_expand != 0:
+                    local_mask = _expand_mask(local_mask, mask_expand)
+                
+                # --- Feathering ---
+                local_mask = _feather_mask(local_mask, feather_amount)
+                
+                # --- Blending ---
                 local_mask_3c = np.repeat(local_mask[:, :, np.newaxis], 3, axis=2)
-                
-                # Composite
                 original_crop = output_img_np[y1:y2, x1:x2]
-                blended = (decoded_np * local_mask_3c + original_crop * (1 - local_mask_3c)).astype(np.uint8)
+                
+                if blend_mode == "soft_light":
+                    blended = _blend_soft_light(original_crop, decoded_np, local_mask_3c)
+                elif blend_mode == "overlay":
+                    blended = _blend_overlay(original_crop, decoded_np, local_mask_3c)
+                else:
+                    blended = _blend_normal(original_crop, decoded_np, local_mask_3c)
                 
                 output_img_np[y1:y2, x1:x2] = blended
                 full_mask[y1:y2, x1:x2] = np.maximum(full_mask[y1:y2, x1:x2], local_mask)

@@ -33,7 +33,7 @@ app.registerExtension({
                 const zenContainer = $el("div.zen-container", [
                     $el("div.zen-header", [
                         $el("h3", { textContent: "ZenFaceDetailer" }),
-                        $el("span.zen-badge", { textContent: "v1.0" })
+                        $el("span.zen-badge", { textContent: "v1.1" })
                     ]),
                     $el("div.zen-tabs", [
                         $el("button.zen-tab-btn.active", { textContent: "Main", onclick: (e) => switchTab(e, 'main') }),

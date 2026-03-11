@@ -11,7 +11,11 @@ An all-in-one ComfyUI face detailing node that combines **face detection** + **i
 - **Automatic face detection** via Impact Pack's BBOX_DETECTOR
 - **Per-face VAE encode → KSample → VAE decode** pipeline
 - **Advanced sampler controls** — choose any sampler, scheduler, noise type, and sampling mode (standard/unsample/resample)
-- **Feathered mask blending** — smooth compositing with no hard edges
+- **Shaped mask blending** — ellipse, squircle, or rectangle masks for natural face-shaped transitions
+- **Smooth feathering** — distance-transform-based feathering for artifact-free compositing, even at high denoise
+- **Blend modes** — normal, soft light, and overlay blending for seamless integration
+- **Color matching** — automatic per-channel color statistics transfer prevents color shifts at high denoise
+- **Mask expand/shrink** — fine-tune the mask boundary before feathering
 - **Batch processing** — handles multiple images in a batch
 - **Outputs both image and mask** — use the mask for further processing downstream
 - **VAE-aligned crops** — automatically pads face crops to multiples of 8
@@ -97,7 +101,19 @@ Restart ComfyUI.
 | `bbox_dilation` | `10` | Expand/shrink detected bbox (pixels) |
 | `bbox_crop_factor` | `3.0` | How much area around the face to crop |
 | `drop_size` | `10` | Minimum face size to process (pixels) |
-| `blur_mask` | `16` | Feathered edge blending width |
+
+### Mask & Feathering Settings
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mask_shape` | `ellipse` | Shape of the compositing mask: **ellipse** (natural face shape), **squircle** (rounded rectangle), or **rectangle** |
+| `feather_amount` | `40` | Pixel radius of the soft feathered falloff (0–200). Higher = softer edges |
+| `mask_expand` | `0` | Expand (positive) or shrink (negative) the mask before feathering (-100 to 100) |
+
+### Blending Settings
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `blend_mode` | `normal` | How the detailed face blends: **normal** (standard alpha), **soft_light** (subtle, preserves shadows), **overlay** (contrasty, punchy) |
+| `color_match` | `True` | Match color statistics of the detailed region to the original — prevents color shifts at high denoise |
 
 ### Sampler Settings
 | Parameter | Default | Description |
@@ -120,12 +136,29 @@ Restart ComfyUI.
 
 ---
 
+## 💡 Blending Tips
+
+| Scenario | Recommended Settings |
+|----------|---------------------|
+| **Low denoise (< 0.5)** | `normal` blend, `feather_amount` 20–40, `color_match` off |
+| **High denoise (0.5–0.8)** | `soft_light` blend, `feather_amount` 60–100, `color_match` on |
+| **Very high denoise (> 0.8)** | `soft_light` or `overlay`, `feather_amount` 100+, `mask_shape` ellipse, `color_match` on |
+| **Multiple faces, different sizes** | Use `squircle` shape if ellipse clips edges on small faces |
+
+---
+
 ## 📋 Requirements
 
 - **ComfyUI** (latest version recommended)
 - **[ComfyUI Impact Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)** — provides face detection
 - **opencv-python** — listed in `requirements.txt`
 - **Python 3.10+**
+
+---
+
+## ⚠️ Upgrading from v1.0
+
+v1.1 replaces `blur_mask` with the new `mask_shape`, `feather_amount`, `mask_expand`, `blend_mode`, and `color_match` parameters. If you have existing workflows using the old node, you'll need to delete and re-add the ZenFaceDetailer node, or manually update your workflow JSON.
 
 ---
 
